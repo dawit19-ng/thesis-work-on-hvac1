@@ -4,17 +4,18 @@ hvac_energy_forecasting.py
 This script implements deep learning models (LSTM, BiLSTM, GRU, SSM-inspired)
 to forecast HVAC chiller energy consumption using hourly time-series data.
 
-It includes:
+ It includes:
 - Data loading and preprocessing
 - Feature engineering (temporal, lag, rolling statistics)
-- Sequence creation for LSTM/GRU models
+-Sequencecreation for LSTM/GRU models
 - Model definitions
-- Training with early stopping and learning rate scheduler
+- Training with early stoping and learning rate scheduler
 - Evaluation metrics (RMSE, MAE, R², MAPE, Accuracy)
-- Baseline models (Random Forest, XGBoost)
+- Baseline models(Random Forest, XGBoost)
 - Ensemble predictions and visualization
 
-Author: Abrha Dawit Nigusse
+Authors: Abrha Dawit Nigusse
+
 """
 
 import pandas as pd
@@ -420,3 +421,4 @@ if __name__ == "__main__":
     plt.show()
 
     print("\nTraining complete. Models saved locally (*_hvac_model.pth)")
+
