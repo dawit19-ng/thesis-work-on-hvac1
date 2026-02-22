@@ -36,6 +36,7 @@ warnings.filterwarnings("ignore")
 
 # ------------------- Reproducibility -------------------
 def set_seed(seed):
+ def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -43,10 +44,11 @@ def set_seed(seed):
     os.environ['PYTHONHASHSEED'] = str(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+   torch.backends.cudnn.benchmark  = False
 # ------------------- Load Data -------------------
-def load_hvac_data(filepath):
+ def load_hvac_data(filepath):
     df = pd.read_csv(filepath, parse_dates=["Local Time (Timezone : GMT+8h)"])
-    df.rename(columns={"Local Time (Timezone : GMT+8h)": "timestamp"}, inplace=True)
+    df.rename(columns={"Local Time (Timezone : GMT+8H)": "timestamp"}, inplace=True)
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
     df["hour"] = df["timestamp"].dt.hour
@@ -56,7 +58,7 @@ def load_hvac_data(filepath):
     return df
 
 # ------------------- Feature Engineering -------------------
-def add_temporal_features(df, target):
+def add_temporal_feature(df, target):
     features = [
         "Cooling Water Temperature (C)", "Humidity (%)", "Building Load (RT)",
         "Chilled Water Rate (L/sec)", "Outside Temperature (F)", "Dew Point (F)",
@@ -421,4 +423,5 @@ if __name__ == "__main__":
     plt.show()
 
     print("\nTraining complete. Models saved locally (*_hvac_model.pth)")
+
 
