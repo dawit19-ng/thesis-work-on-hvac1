@@ -72,15 +72,14 @@ def add_temporal_feature(df, target):
         df[f"{target}_roll_mean_{window}"] = df[target].rolling(window).mean()
         df[f"{target}_roll_std_{window}"] = df[target].rolling(window).std()
         features.extend([f"{target}_roll_mean_{window}", f"{target}_roll_std_{window}"])
-#missing value via forward and backward fill
+#missing value via forward and backward fill 
     df.ffill(inplace=True)
     df.bfill(inplace=True)
     #target= chiller energy consumption(kw)
     df[target] = df[target].clip(lower=df[target].quantile(0.01),
                                  upper=df[target].quantile(0.99))
     return df, features
-
-# ------------------- Sequence Creation -------------------
+# ------------------- Sequence Creation-------------------
 def create_sequences(features_scaled, target_scaled, look_back=72):
     X, y = [], []
     for i in range(look_back, len(features_scaled)):
@@ -423,5 +422,6 @@ if __name__ == "__main__":
     plt.show()
 
     print("\nTraining complete. Models saved locally (*_hvac_model.pth)")
+
 
 
