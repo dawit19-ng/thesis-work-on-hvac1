@@ -19,152 +19,101 @@ Authors: Abrha Dawit Nigusse
 """
 
 """
-hvac_energy_forecasting.py (Upgraded with Real Mamba - Dec 2025)
+hvac_energy_forecasting.py (Upgraded with Mamba inspire - Dec 2025)
 
-This script implements deep learning models (LSTM, BiLSTM, GRU, Real Mamba)
+This script implements deep learning models (LSTM, BiLSTM, GRU, Mamba inspire)
 to forecast HVAC chiller energy consumption using hourly time-series data.
 
 Author: Abrha Dawit Nigusse (original) + Grok upgrade with real Mamba
 """
 
-import pandas as pd
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+import os, random, math
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+
+import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
-import math, warnings
-import matplotlib.pyplot as plt
-import seaborn as sns
-import os, random
-
-# ----- NEW: Import real Mamba -----
-from mamba_ssm import Mamba  # pip install mamba-ssm
-
-warnings.filterwarnings("ignore")
-
 
 # ------------------- Reproducibility -------------------
 def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
 set_seed(42)
 
-
-# ------------------- Load Data -------------------
+# ------------------- Data & Features (unchanged) -------------------
 def load_hvac_data(filepath):
     df = pd.read_csv(filepath, parse_dates=["Local Time (Timezone : GMT+8h)"])
     df.rename(columns={"Local Time (Timezone : GMT+8h)": "timestamp"}, inplace=True)
-    df.sort_values("timestamp", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    df.sort_values("timestamp", inplace=True); df.reset_index(drop=True, inplace=True)
     df["hour"] = df["timestamp"].dt.hour
     df["day_of_week"] = df["timestamp"].dt.dayofweek
-    df.ffill(inplace=True)
-    df.bfill(inplace=True)
+    df.ffill(inplace=True); df.bfill(inplace=True)
     return df
 
-
-# ------------------- Feature Engineering -------------------
 def add_temporal_features(df, target):
-    features = [
-        "Cooling Water Temperature (C)", "Humidity (%)", "Building Load (RT)",
-        "Chilled Water Rate (L/sec)", "Outside Temperature (F)", "Dew Point (F)",
-        "Wind Speed (mph)", "Pressure (in)", "hour", "day_of_week"
-    ]
-    for lag in [1, 2, 3]:
+    base = ["Cooling Water Temperature (C)","Humidity (%)","Building Load (RT)",
+            "Chilled Water Rate (L/sec)","Outside Temperature (F)","Dew Point (F)",
+            "Wind Speed (mph)","Pressure (in)","hour","day_of_week"]
+    feats = base[:]
+    for lag in [1,2,3]:
         df[f"{target}_lag{lag}"] = df[target].shift(lag)
-        features.append(f"{target}_lag{lag}")
-
-    for window in [3, 6]:
-        df[f"{target}_roll_mean_{window}"] = df[target].rolling(window).mean()
-        df[f"{target}_roll_std_{window}"] = df[target].rolling(window).std()
-        features.extend([f"{target}_roll_mean_{window}", f"{target}_roll_std_{window}"])
-
-    df.ffill(inplace=True)
-    df.bfill(inplace=True)
+        feats.append(f"{target}_lag{lag}")
+    for w in [3,6]:
+        df[f"{target}_roll_mean_{w}"] = df[target].rolling(w).mean()
+        df[f"{target}_roll_std_{w}"]  = df[target].rolling(w).std()
+        feats.extend([f"{target}_roll_mean_{w}", f"{target}_roll_std_{w}"])
+    df.ffill(inplace=True); df.bfill(inplace=True)
     df[target] = df[target].clip(lower=df[target].quantile(0.01),
                                  upper=df[target].quantile(0.99))
-    return df, features
+    return df, feats
 
+def create_sequences(X, y, look_back=72):
+    Xs, ys = [], []
+    for i in range(look_back, len(X)):
+        Xs.append(X[i-look_back:i])
+        ys.append(y[i])
+    return np.array(Xs), np.array(ys)
 
-# ------------------- Sequence Creation -------------------
-def create_sequences(features_scaled, target_scaled, look_back=72):
-    X, y = [], []
-    for i in range(look_back, len(features_scaled)):
-        X.append(features_scaled[i - look_back:i])
-        y.append(target_scaled[i])
-    return np.array(X), np.array(y)
+def scale_splits(train_df, val_df, test_df, feats, target):
+    f_scaler = MinMaxScaler().fit(train_df[feats])
+    t_scaler = MinMaxScaler().fit(train_df[[target]])
+    return (f_scaler.transform(train_df[feats]), f_scaler.transform(val_df[feats]),
+            f_scaler.transform(test_df[feats]),
+            t_scaler.transform(train_df[[target]]), t_scaler.transform(val_df[[target]]),
+            t_scaler.transform(test_df[[target]]), f_scaler, t_scaler)
 
-
-# ------------------- Scaling -------------------
-def scale_splits(train_df, val_df, test_df, features, target):
-    feature_scaler = MinMaxScaler().fit(train_df[features])
-    target_scaler = MinMaxScaler().fit(train_df[[target]])
-
-    train_f = feature_scaler.transform(train_df[features])
-    val_f = feature_scaler.transform(val_df[features])
-    test_f = feature_scaler.transform(test_df[features])
-
-    train_t = target_scaler.transform(train_df[[target]])
-    val_t = target_scaler.transform(val_df[[target]])
-    test_t = target_scaler.transform(test_df[[target]])
-
-    return train_f, val_f, test_f, train_t, val_t, test_t, feature_scaler, target_scaler
-
-
-# ------------------- Existing Models (LSTM, BiLSTM, GRU) -------------------
+# ------------------- RNN models (unchanged) -------------------
 class LSTMNet(nn.Module):
     def __init__(self, input_dim, hidden=32, dropout=0.4):
         super().__init__()
         self.lstm1 = nn.LSTM(input_dim, hidden, batch_first=True, dropout=0, num_layers=1)
         self.lstm2 = nn.LSTM(hidden, hidden, batch_first=True, dropout=0.0, num_layers=1)
         self.dropout = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(hidden, 32)
-        self.fc2 = nn.Linear(32, 1)
-        self.relu = nn.ReLU()
-
+        self.fc1 = nn.Linear(hidden, 32); self.fc2 = nn.Linear(32, 1); self.relu = nn.ReLU()
     def forward(self, x):
-        out, _ = self.lstm1(x)
-        out, _ = self.lstm2(out)
+        out, _ = self.lstm1(x); out, _ = self.lstm2(out)
         out = self.dropout(out[:, -1, :])
-        out = self.relu(self.fc1(out))
-        out = self.fc2(out)
-        return out
-
+        out = self.relu(self.fc1(out)); return self.fc2(out)
 
 class BiLSTMNet(nn.Module):
     def __init__(self, input_dim, hidden=32, dropout=0.3):
         super().__init__()
         self.bilstm1 = nn.LSTM(input_dim, hidden, batch_first=True, bidirectional=True)
-        self.bn = nn.BatchNorm1d(hidden * 2)
-        self.dropout1 = nn.Dropout(dropout)
-        self.bilstm2 = nn.LSTM(hidden * 2, hidden // 2, batch_first=True, bidirectional=True)
+        self.bn = nn.BatchNorm1d(hidden*2); self.dropout1 = nn.Dropout(dropout)
+        self.bilstm2 = nn.LSTM(hidden*2, hidden//2, batch_first=True, bidirectional=True)
         self.dropout2 = nn.Dropout(0.2)
-        self.fc1 = nn.Linear(hidden, 32)
-        self.fc2 = nn.Linear(32, 1)
-        self.relu = nn.ReLU()
-
+        self.fc1 = nn.Linear(hidden, 32); self.fc2 = nn.Linear(32, 1); self.relu = nn.ReLU()
     def forward(self, x):
-        out, _ = self.bilstm1(x)
-        out = self.bn(out[:, -1, :])
-        out = self.dropout1(out)
-        out, _ = self.bilstm2(out.unsqueeze(1))
-        out = self.dropout2(out[:, -1, :])
-        out = self.relu(self.fc1(out))
-        out = self.fc2(out)
-        return out
-
+        out, _ = self.bilstm1(x); out = self.bn(out[:, -1, :]); out = self.dropout1(out)
+        out, _ = self.bilstm2(out.unsqueeze(1)); out = self.dropout2(out[:, -1, :])
+        out = self.relu(self.fc1(out)); return self.fc2(out)
 
 class GRUNet(nn.Module):
     def __init__(self, input_dim, hidden=32, dropout=0.3):
@@ -172,279 +121,213 @@ class GRUNet(nn.Module):
         self.gru1 = nn.GRU(input_dim, hidden, batch_first=True, dropout=0.2, num_layers=1)
         self.gru2 = nn.GRU(hidden, hidden, batch_first=True, dropout=0.0, num_layers=1)
         self.dropout = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(hidden, 32)
-        self.fc2 = nn.Linear(32, 1)
-        self.relu = nn.ReLU()
-
+        self.fc1 = nn.Linear(hidden, 32); self.fc2 = nn.Linear(32, 1); self.relu = nn.ReLU()
     def forward(self, x):
-        out, _ = self.gru1(x)
-        out, _ = self.gru2(out)
+        out, _ = self.gru1(x); out, _ = self.gru2(out)
         out = self.dropout(out[:, -1, :])
-        out = self.relu(self.fc1(out))
-        out = self.fc2(out)
-        return out
+        out = self.relu(self.fc1(out)); return self.fc2(out)
 
-
-# ------------------- Real Mamba Model (2023) -------------------
-class MambaNet(nn.Module):
-    def __init__(self, input_dim, d_model=64, n_layers=4, dropout=0.3):
+# ------------------- CPU-ONLY SSM (no external libs) -------------------
+class SSMBlock(nn.Module):
+    """Lightweight selective SSM – runs fast on CPU (O(T) loop is fine for L=72)"""
+    def __init__(self, d_model, d_state=16):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, d_model)
-
-        self.mamba_blocks = nn.ModuleList([
-            Mamba(
-                d_model=d_model,
-                d_state=16,  # default SSM state size
-                d_conv=4,  # local convolution width
-                expand=2,  # expansion factor
-            ) for _ in range(n_layers)
-        ])
-
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.output_proj = nn.Sequential(
-            nn.Linear(d_model, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
+        self.d_state = d_state
+        # HiPPO-style A (learnable log-scale)
+        A = torch.arange(1, d_state+1).float().diag()
+        self.A_log = nn.Parameter(torch.log(A))
+        # Input → selective B, C, Δ
+        self.proj = nn.Linear(d_model, d_state*3)
+        self.D = nn.Parameter(torch.ones(d_model))
 
     def forward(self, x):
-        x = self.input_proj(x)  # (B, L, d_model)
+        B, L, D = x.shape
+        params = self.proj(x)                # (B, L, 3*N)
+        dt, Bp, Cp = params.chunk(3, dim=-1) # each (B, L, N)
+        dt = F.softplus(dt)                  # Δ > 0
+        A = -torch.exp(self.A_log)           # stable negative diagonal
+        h = torch.zeros(B, self.d_state, device=x.device)
+        outs = []
+        for t in range(L):
+            h = A * h + dt[:, t:t+1] * Bp[:, t] * x[:, t:t+1]
+            y_t = (Cp[:, t] * h).sum(dim=-1) + self.D * x[:, t]
+            outs.append(y_t.unsqueeze(1))
+        return torch.cat(outs, dim=1)
 
-        for block in self.mamba_blocks:
-            x = block(x)
+class SSMNet(nn.Module):
+    """3 SSM blocks → dropout → 32→32→1 (same head as others)"""
+    def __init__(self, input_dim, d_model=64, d_state=16, n_layers=3, dropout=0.3):
+        super().__init__()
+        self.proj_in = nn.Linear(input_dim, d_model)
+        self.blocks  = nn.ModuleList([SSMBlock(d_model, d_state) for _ in range(n_layers)])
+        self.norm    = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(d_model, 32); self.fc2 = nn.Linear(32, 1); self.relu = nn.ReLU()
 
-        x = self.norm(x)
-        x = self.dropout(x[:, -1, :])  # last timestep
-        x = self.output_proj(x)
-        return x
+    def forward(self, x):
+        x = self.proj_in(x)
+        for blk in self.blocks:
+            x = self.norm(x + blk(x))          # residual
+        x = self.dropout(x[:, -1, :])
+        x = self.relu(self.fc1(x)); return self.fc2(x)
 
+# ------------------- Training (CPU-friendly) -------------------
+def train_model(model, train_loader, val_loader,
+                epochs=120, lr=1e-3, patience_es=12, patience_lr=4):
+    device = torch.device('cpu')                     # <-- force CPU
+    model.to(device); criterion = nn.MSELoss()
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    sched = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min',
+                factor=0.5, patience=patience_lr, threshold=1e-4, min_lr=1e-6)
 
-# ------------------- Training Loop (unchanged) -------------------
-def train_model(model, train_loader, val_loader, epochs=100, lr=0.001, patience_es=10, patience_lr=3):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=patience_lr, min_lr=1e-6, threshold=1e-4
-    )
-    best_val = float('inf')
-    wait_es = 0
-
-    train_losses, val_losses = [], []
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        epoch_loss = 0.0
+    best, wait = float('inf'), 0
+    tr_l, va_l = [], []
+    for epoch in range(1, epochs+1):
+        # ---- train ----
+        model.train(); tr_loss = 0.0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            preds = model(xb)
-            loss = criterion(preds, yb)
+            opt.zero_grad()
+            loss = criterion(model(xb), yb)
             loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * xb.size(0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tr_loss += loss.item()*xb.size(0)
+        tr_loss /= len(train_loader.dataset); tr_l.append(tr_loss)
 
-        epoch_loss /= len(train_loader.dataset)
-        train_losses.append(epoch_loss)
-
-        model.eval()
-        val_loss = 0.0
+        # ---- valid ----
+        model.eval(); va_loss = 0.0
         with torch.no_grad():
             for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                preds = model(xb)
-                loss = criterion(preds, yb)
-                val_loss += loss.item() * xb.size(0)
+                va_loss += criterion(model(xb.to(device)), yb.to(device)).item()*xb.size(0)
+        va_loss /= len(val_loader.dataset); va_l.append(va_loss)
+        sched.step(va_loss)
 
-        val_loss /= len(val_loader.dataset)
-        val_losses.append(val_loss)
-
-        scheduler.step(val_loss)
-
-        if val_loss < best_val:
-            best_val = val_loss
-            wait_es = 0
+        if va_loss < best:
+            best, wait = va_loss, 0
             torch.save(model.state_dict(), f"{model.__class__.__name__}_best.pth")
         else:
-            wait_es += 1
-            if wait_es >= patience_es:
-                print(f"Early stopping at epoch {epoch}")
+            wait += 1
+            if wait >= patience_es:
+                print(f"   Early-stop @ epoch {epoch}")
                 break
 
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d} | Train loss: {epoch_loss:.6f} | Val loss: {val_loss:.6f}")
+        if epoch % 20 == 0 or epoch <= 3:
+            print(f"Epoch {epoch:3d} | Train {tr_loss:.6f} | Val {va_loss:.6f}")
 
     model.load_state_dict(torch.load(f"{model.__class__.__name__}_best.pth"))
-    return model, train_losses, val_losses
+    return model, tr_l, va_l
 
-
-# ------------------- Evaluation (unchanged) -------------------
+# ------------------- Evaluation -------------------
 @torch.no_grad()
-def evaluate_model(model, test_loader, target_scaler):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.eval()
-    preds = []
-    trues = []
-    for xb, yb in test_loader:
-        xb = xb.to(device)
-        out = model(xb).cpu().numpy()
-        preds.append(out)
+def evaluate_model(model, loader, t_scaler):
+    device = torch.device('cpu')
+    model.eval(); preds, trues = [], []
+    for xb, yb in loader:
+        preds.append(model(xb.to(device)).cpu().numpy())
         trues.append(yb.numpy())
-    y_pred = np.concatenate(preds, axis=0)
-    y_true = np.concatenate(trues, axis=0)
+    y_pred = np.concatenate(preds); y_true = np.concatenate(trues)
+    return (t_scaler.inverse_transform(y_true),
+            t_scaler.inverse_transform(y_pred))
 
-    y_pred_inv = target_scaler.inverse_transform(y_pred)
-    y_true_inv = target_scaler.inverse_transform(y_true)
-
-    rmse = math.sqrt(mean_squared_error(y_true_inv, y_pred_inv))
-    mae = mean_absolute_error(y_true_inv, y_pred_inv)
-    r2 = r2_score(y_true_inv, y_pred_inv)
-    mape = np.mean(np.abs((y_true_inv - y_pred_inv) / np.where(y_true_inv == 0, 1e-10, y_true_inv))) * 100
-    acc = max(0, 100 - mape)
-    return y_true_inv, y_pred_inv, rmse, mae, r2, mape, acc
-
-
-def evaluate_baseline(y_true, y_pred):
+def metrics(y_true, y_pred):
     rmse = math.sqrt(mean_squared_error(y_true, y_pred))
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
-    mape = np.mean(np.abs((y_true - y_pred) / np.where(y_true == 0, 1e-10, y_true))) * 100
-    acc = max(0, 100 - mape)
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+    mape = np.mean(np.abs((y_true-y_pred)/np.clip(y_true,1e-8,None)))*100
+    acc  = max(0, 100-mape)
     return rmse, mae, r2, mape, acc
-
 
 # ------------------- MAIN -------------------
 if __name__ == "__main__":
-    filepath = "hvac_dataset.csv"
-    df = load_hvac_data(filepath)
+    # ---- load & engineer ----
+    df = load_hvac_data("hvac_dataset.csv")
     target = "Chiller Energy Consumption (kWh)"
-    df, features = add_temporal_features(df, target)
+    df, feats = add_temporal_features(df, target)
 
-    # Split
-    split_1 = int(0.7 * len(df))
-    split_2 = int(0.9 * len(df))
-    train_df, val_df, test_df = df[:split_1], df[split_1:split_2], df[split_2:]
+    # ---- split ----
+    n = len(df)
+    train_df, val_df, test_df = df[:int(0.7*n)], df[int(0.7*n):int(0.9*n)], df[int(0.9*n):]
 
-    # Scale & Sequence
+    # ---- scale & seq ----
     look_back = 72
     (train_f, val_f, test_f,
      train_t, val_t, test_t,
-     f_scaler, t_scaler) = scale_splits(train_df, val_df, test_df, features, target)
+     f_scaler, t_scaler) = scale_splits(train_df, val_df, test_df, feats, target)
 
-    X_train, y_train = create_sequences(train_f, train_t, look_back)
-    X_val, y_val = create_sequences(val_f, val_t, look_back)
-    X_test, y_test = create_sequences(test_f, test_t, look_back)
+    X_tr, y_tr = create_sequences(train_f, train_t, look_back)
+    X_va, y_va = create_sequences(val_f,   val_t,   look_back)
+    X_te, y_te = create_sequences(test_f,  test_t,  look_back)
 
-    # DataLoaders
-    batch_size = 16
-    train_loader = DataLoader(TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train)),
-                              batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val)),
-                            batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test)),
-                             batch_size=batch_size, shuffle=False)
+    batch = 32
+    train_loader = DataLoader(TensorDataset(torch.FloatTensor(X_tr), torch.FloatTensor(y_tr)),
+                              batch_size=batch, shuffle=True)
+    val_loader   = DataLoader(TensorDataset(torch.FloatTensor(X_va), torch.FloatTensor(y_va)),
+                              batch_size=batch, shuffle=False)
+    test_loader  = DataLoader(TensorDataset(torch.FloatTensor(X_te), torch.FloatTensor(y_te)),
+                              batch_size=batch, shuffle=False)
 
-    # Models - Now with REAL Mamba
-    input_dim = X_train.shape[2]
+    # ---- models ----
+    input_dim = X_tr.shape[2]
     models = {
-        "LSTM": LSTMNet(input_dim),
-        "BiLSTM": BiLSTMNet(input_dim),
-        "GRU": GRUNet(input_dim),
-        "Mamba": MambaNet(input_dim, d_model=64, n_layers=4),  # Real 2023 Mamba
+        "LSTM":    LSTMNet(input_dim),
+        "BiLSTM":  BiLSTMNet(input_dim),
+        "GRU":     GRUNet(input_dim),
+        "SSM":     SSMNet(input_dim, d_model=64, d_state=16, n_layers=3)
     }
 
-    results = []
-    y_preds_dict = {}
-    y_true_global = None  # Will store for ensemble
-
+    results, pred_dict = [], {}
     for name, net in models.items():
-        print(f"\nTraining {name}...")
-        lr = 0.0005 if name == "LSTM" else 0.001
-        trained_net, train_loss, val_loss = train_model(
-            net, train_loader, val_loader, epochs=100, lr=lr)
+        print(f"\n=== Training {name} (CPU) ===")
+        trained, tr_l, va_l = train_model(net, train_loader, val_loader,
+                                          epochs=120,
+                                          lr=5e-4 if name=="LSTM" else 1e-3)
 
-        torch.save(trained_net.state_dict(), f"{name}_hvac_model.pth")
-
-        y_true, y_pred, rmse, mae, r2, mape, acc = evaluate_model(trained_net, test_loader, t_scaler)
-        if y_true_global is None:
-            y_true_global = y_true
-
+        y_true, y_pred = evaluate_model(trained, test_loader, t_scaler)
+        pred_dict[name] = y_pred
+        rmse, mae, r2, mape, acc = metrics(y_true, y_pred)
         results.append([name, rmse, mae, r2, mape, acc])
-        y_preds_dict[name] = y_pred
 
-        # Plots
-        plt.figure(figsize=(8, 4))
-        plt.plot(train_loss, label='Train Loss')
-        plt.plot(val_loss, label='Val Loss')
-        plt.title(f"{name} Training Curve")
-        plt.xlabel("Epoch");
-        plt.ylabel("MSE");
-        plt.legend()
-        plt.tight_layout();
-        plt.show()
+        # loss curves
+        plt.figure(figsize=(8,3))
+        plt.plot(tr_l, label='train'); plt.plot(va_l, label='val')
+        plt.title(f"{name} loss"); plt.legend(); plt.show()
 
-        plt.figure(figsize=(12, 4))
-        plt.plot(y_true[:300], label='Actual')
-        plt.plot(y_pred[:300], label='Predicted')
-        plt.title(f"{name} Predictions (sample)")
-        plt.xlabel("Time Step");
-        plt.ylabel("Energy (kWh)");
-        plt.legend()
-        plt.tight_layout();
-        plt.show()
+        plt.figure(figsize=(12,4))
+        plt.plot(y_true[:400], label='True')
+        plt.plot(y_pred[:400], label='Pred')
+        plt.title(f"{name} – sample"); plt.legend(); plt.show()
 
-    # Ensemble (deep models only)
-    y_ensemble = np.mean(np.stack(list(y_preds_dict.values())), axis=0)
-    rmse_ens = math.sqrt(mean_squared_error(y_true_global, y_ensemble))
-    mae_ens = mean_absolute_error(y_true_global, y_ensemble)
-    r2_ens = r2_score(y_true_global, y_ensemble)
-    mape_ens = np.mean(np.abs((y_true_global - y_ensemble) / np.where(y_true_global == 0, 1e-10, y_true_global))) * 100
-    acc_ens = max(0, 100 - mape_ens)
-    results.append(["Ensemble", rmse_ens, mae_ens, r2_ens, mape_ens, acc_ens])
+    # ---- ensemble (4 models) ----
+    ens = np.mean(np.stack([pred_dict[k] for k in pred_dict]), axis=0)
+    rmse_e, mae_e, r2_e, mape_e, acc_e = metrics(y_true, ens)
+    results.append(["Ensemble", rmse_e, mae_e, r2_e, mape_e, acc_e])
 
+    # ---- tree baselines ----
+    def flatten(X): return np.hstack([X.mean(axis=1), X.std(axis=1), X[:, -1, :]])
+    X_tr_f = flatten(X_tr); X_te_f = flatten(X_te)
+    y_tr_f = t_scaler.inverse_transform(y_tr).ravel()
+    y_te_f = t_scaler.inverse_transform(y_te).ravel()
 
-    # Baselines (RF & XGBoost)
-    def aggregate_features(X):
-        return np.hstack([X.mean(axis=1), X.std(axis=1), X[:, -1, :]])
+    rf = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
+    rf.fit(X_tr_f, y_tr_f); rf_pred = rf.predict(X_te_f)
+    results.append(["RandomForest"] + list(metrics(y_te_f, rf_pred)))
 
+    xgb = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=6,
+                       subsample=0.8, colsample_bytree=0.8,
+                       random_state=42, n_jobs=-1)
+    xgb.fit(X_tr_f, y_tr_f); xgb_pred = xgb.predict(X_te_f)
+    results.append(["XGBoost"] + list(metrics(y_te_f, xgb_pred)))
 
-    X_train_flat = aggregate_features(X_train)
-    X_test_flat = aggregate_features(X_test)
-    y_train_flat = y_train.ravel()
-    y_test_flat = y_test.ravel()
+    # ---- final table & bar plot ----
+    df_res = pd.DataFrame(results,
+                columns=["Model","RMSE","MAE","R²","MAPE","Accuracy (%)"]).round(4)
+    print("\n========== FINAL COMPARISON (CPU) ==========")
+    print(df_res)
 
-    rf = RandomForestRegressor(n_estimators=200, random_state=42)
-    rf.fit(X_train_flat, y_train_flat)
-    rf_pred = rf.predict(X_test_flat)
-
-    xgb = XGBRegressor(n_estimators=200, learning_rate=0.1, random_state=42)
-    xgb.fit(X_train_flat, y_train_flat)
-    xgb_pred = xgb.predict(X_test_flat)
-
-    rmse_rf, mae_rf, r2_rf, mape_rf, acc_rf = evaluate_baseline(y_test_flat, rf_pred)
-    rmse_xgb, mae_xgb, r2_xgb, mape_xgb, acc_xgb = evaluate_baseline(y_test_flat, xgb_pred)
-
-    results.extend([
-        ["RandomForest", rmse_rf, mae_rf, r2_rf, mape_rf, acc_rf],
-        ["XGBoost", rmse_xgb, mae_xgb, r2_xgb, mape_xgb, acc_xgb]
-    ])
-
-    # Summary
-    results_df = pd.DataFrame(results, columns=["Model", "RMSE", "MAE", "R²", "MAPE", "Accuracy"])
-    print("\n================ Model Comparison ================")
-    print(results_df.round(4))
-
-    plt.figure(figsize=(10, 5))
-    plt.bar(results_df["Model"], results_df["Accuracy"], color="skyblue", edgecolor="black")
-    plt.title("Model Accuracy Comparison (%)")
-    plt.ylabel("Accuracy (%)")
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-
-    print("\nTraining complete. Models saved locally (*_hvac_model.pth)")
-
+    plt.figure(figsize=(9,5))
+    bars = plt.bar(df_res["Model"], df_res["Accuracy (%)"],
+                   color=["#8da0cb" if "SSM" not in m else "#66c2a5" for m in df_res["Model"]],
+                   edgecolor="black")
+    plt.title("Forecast Accuracy (100-MAPE) – CPU"); plt.ylabel("Accuracy (%)")
+    plt.ylim(0,100); plt.xticks(rotation=15); plt.tight_layout(); plt.show()
