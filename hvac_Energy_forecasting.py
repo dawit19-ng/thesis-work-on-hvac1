@@ -15,18 +15,14 @@ to forecast HVAC chiller energy consumption using hourly time-series data.
 - Ensemble predictions and visualization
 
 Authors: Abrha Dawit Nigusse
-
+ 
 """
 
-"""
-hvac_energy_forecasting.py (Upgraded with Mamba inspire - Dec 2025)
+# ================================================================
+#  Chiller Forcasting- LSTM / BiLSTM/ GRU / CPU-ONLY SSM model
+#  (Zero external deps – pure PyTorch )
 
-This script implements deep learning models (LSTM, BiLSTM, GRU, Mamba inspire)
-to forecast HVAC chiller energy consumption using hourly time-series data.
-
-Author: Abrha Dawit Nigusse (original) + Grok upgrade with real Mamba
-"""
-
+# ================================================================
 import os, random, math
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
 
@@ -129,47 +125,53 @@ class GRUNet(nn.Module):
 
 # ------------------- CPU-ONLY SSM (no external libs) -------------------
 class SSMBlock(nn.Module):
-    """Lightweight selective SSM – runs fast on CPU (O(T) loop is fine for L=72)"""
     def __init__(self, d_model, d_state=16):
         super().__init__()
         self.d_state = d_state
-        # HiPPO-style A (learnable log-scale)
-        A = torch.arange(1, d_state+1).float().diag()
-        self.A_log = nn.Parameter(torch.log(A))
-        # Input → selective B, C, Δ
-        self.proj = nn.Linear(d_model, d_state*3)
-        self.D = nn.Parameter(torch.ones(d_model))
+        # diagonal A for stability
+        self.A_log = nn.Parameter(torch.zeros(d_state))
+        # project input -> (3 * d_state)
+        self.proj = nn.Linear(d_model, 3*d_state)
+        self.D = nn.Parameter(torch.ones(d_model))  # output residual
 
     def forward(self, x):
         B, L, D = x.shape
-        params = self.proj(x)                # (B, L, 3*N)
-        dt, Bp, Cp = params.chunk(3, dim=-1) # each (B, L, N)
-        dt = F.softplus(dt)                  # Δ > 0
-        A = -torch.exp(self.A_log)           # stable negative diagonal
+        # project
+        params = self.proj(x)               # (B, L, 3*d_state)
+        dt, Bp, Cp = params.chunk(3, dim=-1)  # each (B, L, d_state)
+        dt = F.softplus(dt)                 # ensure positive
+        A = -torch.exp(self.A_log)          # stable negative diagonal
+
         h = torch.zeros(B, self.d_state, device=x.device)
         outs = []
         for t in range(L):
-            h = A * h + dt[:, t:t+1] * Bp[:, t] * x[:, t:t+1]
-            y_t = (Cp[:, t] * h).sum(dim=-1) + self.D * x[:, t]
+            # elementwise ops: all (B, d_state)
+            h = A * h + dt[:, t] * Bp[:, t]   # (B, d_state)
+            y_t = (Cp[:, t] * h).sum(dim=-1) + (x[:, t] * self.D).sum(dim=-1)  # (B,)
             outs.append(y_t.unsqueeze(1))
-        return torch.cat(outs, dim=1)
+        return torch.cat(outs, dim=1)  # (B, L)
 
 class SSMNet(nn.Module):
-    """3 SSM blocks → dropout → 32→32→1 (same head as others)"""
     def __init__(self, input_dim, d_model=64, d_state=16, n_layers=3, dropout=0.3):
         super().__init__()
         self.proj_in = nn.Linear(input_dim, d_model)
         self.blocks  = nn.ModuleList([SSMBlock(d_model, d_state) for _ in range(n_layers)])
         self.norm    = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(d_model, 32); self.fc2 = nn.Linear(32, 1); self.relu = nn.ReLU()
+        self.fc1 = nn.Linear(d_model, 32)
+        self.fc2 = nn.Linear(32, 1)
+        self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = self.proj_in(x)
+        x = self.proj_in(x)        # (B, L, d_model)
         for blk in self.blocks:
-            x = self.norm(x + blk(x))          # residual
+            y = blk(x)             # (B, L)
+            # expand last dim to match d_model for residual
+            y_exp = y.unsqueeze(-1).expand(-1, -1, x.shape[2])
+            x = self.norm(x + y_exp)
         x = self.dropout(x[:, -1, :])
-        x = self.relu(self.fc1(x)); return self.fc2(x)
+        x = self.relu(self.fc1(x))
+        return self.fc2(x)
 
 # ------------------- Training (CPU-friendly) -------------------
 def train_model(model, train_loader, val_loader,
